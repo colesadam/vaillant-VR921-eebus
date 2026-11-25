@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 logger = logging.getLogger("VR921")
 
-CERT_DIR = "/opt/Vaillant-VR921/certs"
+CERT_DIR = os.getenv("EEBUS_CERT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs"))
 os.makedirs(CERT_DIR, exist_ok=True)
 
 class MsgCounter:
@@ -150,15 +150,25 @@ class HAMqttPublisher:
         self.username = _env_str("HA_MQTT_USER", secrets_user)
         self.password = _env_str("HA_MQTT_PASSWORD", secrets_password)
         self.enabled = bool(self.host)
-        self.retain_state = _env_bool("SHIP_MQTT_RETAIN_STATE", False)
+        self.retain_state = _env_bool("SHIP_MQTT_RETAIN_STATE", True)
         self._discovered_object_ids: set[str] = set()
+        self._discovered_configs: Dict[str, str] = {}
         self._mqtt = None
+        self.command_callback: Optional[Any] = None
+
+    def _republish_all_discovery(self) -> None:
+        if not self.enabled or self._mqtt is None: return
+        self.publish_availability(True)
+        self.ensure_control_discovery()
+        for topic, payload_json in list(self._discovered_configs.items()):
+            self._mqtt.publish(topic, payload_json, qos=0, retain=True)
 
     def connect(self) -> None:
         if not self.enabled: return
+        if self._mqtt is not None: return
         try: import paho.mqtt.client as mqtt
         except Exception:
-            print("⚠️  [MQTT] paho-mqtt fehlt.")
+            logger.warning("⚠️  [MQTT] paho-mqtt not available.")
             self.enabled = False
             return
 
@@ -172,16 +182,58 @@ class HAMqttPublisher:
         if self.username: client.username_pw_set(self.username, self.password or None)
         try: client.will_set(self._topic_availability(), payload="offline", qos=0, retain=True)
         except Exception: pass
+
+        def _on_connect(c, userdata, flags, rc, properties=None):
+            if rc == 0:
+                logger.info(f"✅ [MQTT] Connected to mqtt://{self.host}:{self.port}")
+                c.subscribe("ship/vr921/+/+/set")
+                c.subscribe("ship/vr921/heating/cancel_override/set")
+                c.subscribe(f"{self.base_prefix}/status")
+                try:
+                    self._republish_all_discovery()
+                except Exception as exc:
+                    logger.warning("Failed to republish discovery on MQTT connect: %s", exc)
+            else:
+                logger.warning(f"⚠️  [MQTT] Connect callback returned rc={rc}")
+
+        def _on_message(c, userdata, msg):
+            try:
+                topic = msg.topic
+                payload = msg.payload.decode("utf-8").strip()
+                if topic == f"{self.base_prefix}/status":
+                    if payload.lower() == "online":
+                        logger.info("📡 Home Assistant MQTT birth detected ('online') — republishing EEBUS discovery & availability")
+                        self._republish_all_discovery()
+                    return
+                logger.info("📩 MQTT command received: %s -> %s", topic, payload)
+                if self.command_callback:
+                    self.command_callback(topic, payload)
+            except Exception as exc:
+                logger.error("Error processing MQTT message: %s", exc)
+
+        client.on_connect = _on_connect
+        client.on_message = _on_message
+
         try:
             client.connect(self.host, self.port, keepalive=30)
             client.loop_start()
             self._mqtt = client
-            self.publish_availability(True)
-            print(f"✅ [MQTT] Connected to mqtt://{self.host}:{self.port}")
         except Exception as e:
-            print(f"⚠️  [MQTT] Connect failed: {e}")
+            logger.warning(f"⚠️  [MQTT] Connect failed: {e}")
             self.enabled = False
             self._mqtt = None
+
+    def publish_crashed(self, reason: str = "unreachable") -> None:
+        if not self.enabled: return
+        if self._mqtt is None:
+            self.connect()
+        if self._mqtt is not None:
+            try:
+                payload = json.dumps({"status": "crashed", "reason": reason, "timestamp": time.time()})
+                self._mqtt.publish("ship/vr921/crashed", payload=payload, qos=1)
+                logger.info("📢 Published crash trigger to MQTT: ship/vr921/crashed (%s)", reason)
+            except Exception as e:
+                logger.error("Failed to publish crash trigger to MQTT: %s", e)
 
     def close(self) -> None:
         if not self.enabled or self._mqtt is None: return
@@ -201,6 +253,109 @@ class HAMqttPublisher:
         if not self.enabled or self._mqtt is None: return
         self._mqtt.publish(self._topic_availability(), payload=("online" if online else "offline"), qos=0, retain=True)
 
+    def ensure_control_discovery(self) -> None:
+        if not self.enabled or self._mqtt is None: return
+        dev = {"identifiers": [self.device_id], "name": self.device_name}
+        
+        mode_conf = {
+            "name": "Heating Mode",
+            "unique_id": f"{self.device_id}_heating_mode",
+            "command_topic": "ship/vr921/heating/mode/set",
+            "state_topic": "ship/vr921/heating/mode/state",
+            "options": ["auto", "on", "off", "eco"],
+            "icon": "mdi:radiator",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/select/{self.device_id}/heating_mode/config", json.dumps(mode_conf), qos=0, retain=True)
+
+        temp_conf = {
+            "name": "Heating Day Target",
+            "unique_id": f"{self.device_id}_heating_temp",
+            "command_topic": "ship/vr921/heating/temp/set",
+            "state_topic": "ship/vr921/heating/temp/state",
+            "min": 15.0,
+            "max": 25.0,
+            "step": 0.5,
+            "unit_of_measurement": "°C",
+            "mode": "box",
+            "icon": "mdi:thermometer",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/number/{self.device_id}/heating_temp/config", json.dumps(temp_conf), qos=0, retain=True)
+
+        cancel_conf = {
+            "name": "Cancel Heating Override",
+            "unique_id": f"{self.device_id}_cancel_override",
+            "command_topic": "ship/vr921/heating/cancel_override/set",
+            "payload_press": "auto",
+            "icon": "mdi:restore",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/button/{self.device_id}/cancel_override/config", json.dumps(cancel_conf), qos=0, retain=True)
+
+        dhw_mode_conf = {
+            "name": "DHW Mode",
+            "unique_id": f"{self.device_id}_dhw_mode",
+            "command_topic": "ship/vr921/dhw/mode/set",
+            "state_topic": "ship/vr921/dhw/mode/state",
+            "options": ["auto", "on", "off", "eco"],
+            "icon": "mdi:water-boiler",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/select/{self.device_id}/dhw_mode/config", json.dumps(dhw_mode_conf), qos=0, retain=True)
+
+        dhw_temp_conf = {
+            "name": "DHW Target",
+            "unique_id": f"{self.device_id}_dhw_temp",
+            "command_topic": "ship/vr921/dhw/temp/set",
+            "state_topic": "ship/vr921/dhw/temp/state",
+            "min": 35.0,
+            "max": 65.0,
+            "step": 1.0,
+            "unit_of_measurement": "°C",
+            "mode": "box",
+            "icon": "mdi:thermometer-water",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/number/{self.device_id}/dhw_temp/config", json.dumps(dhw_temp_conf), qos=0, retain=True)
+
+        climate_conf = {
+            "name": "Heating",
+            "unique_id": f"{self.device_id}_heating_climate",
+            "mode_command_topic": "ship/vr921/heating/mode/set",
+            "mode_state_topic": "ship/vr921/heating/mode/state",
+            "modes": ["auto", "heat", "off"],
+            "mode_state_template": "{{ 'heat' if value == 'on' else value }}",
+            "temperature_command_topic": "ship/vr921/heating/temp/set",
+            "temperature_state_topic": "ship/vr921/heating/temp/state",
+            "current_temperature_topic": f"{self.state_prefix}/{self.device_id}/roomairtemperature_e5_1_1_f11_id0/state",
+            "action_topic": "ebus_passive/heating_action/state",
+            "action_template": "{{ value }}",
+            "min_temp": 15.0,
+            "max_temp": 25.0,
+            "temp_step": 0.5,
+            "temperature_unit": "C",
+            "icon": "mdi:heat-pump-outline",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/climate/{self.device_id}/heating/config", json.dumps(climate_conf), qos=0, retain=True)
+
+        conn_conf = {
+            "name": "Connection Status",
+            "unique_id": f"{self.device_id}_connection",
+            "state_topic": self._topic_availability(),
+            "payload_on": "online",
+            "payload_off": "offline",
+            "device_class": "connectivity",
+            "device": dev,
+        }
+        self._mqtt.publish(f"{self.base_prefix}/binary_sensor/{self.device_id}/connection/config", json.dumps(conn_conf), qos=0, retain=True)
+
+    def publish_control_state(self, subpath: str, value: str) -> None:
+        if not self.enabled or self._mqtt is None: return
+        topic = f"{self.state_prefix}/vr921/{subpath}/state"
+        self._mqtt.publish(topic, payload=value, qos=0, retain=True)
+
     def ensure_discovery(self, *, object_id: str, name: str, unit: str, device_class: str, state_class: str) -> None:
         if not self.enabled or self._mqtt is None: return
         if object_id in self._discovered_object_ids: return
@@ -216,7 +371,10 @@ class HAMqttPublisher:
         if unit: payload["unit_of_measurement"] = unit
         if device_class: payload["device_class"] = device_class
         if state_class: payload["state_class"] = state_class
-        self._mqtt.publish(self._topic_config(object_id), json.dumps(payload, ensure_ascii=False), qos=0, retain=True)
+        config_topic = self._topic_config(object_id)
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        self._discovered_configs[config_topic] = payload_json
+        self._mqtt.publish(config_topic, payload_json, qos=0, retain=True)
         self._discovered_object_ids.add(object_id)
 
     def publish_state(self, *, object_id: str, value: float) -> None:
@@ -312,10 +470,13 @@ class MDNSHandler(ServiceListener):
             if remote_ski and remote_ski == self.ski: return
             if not self.target_info: self.target_info = info
 
+ws_send_lock = asyncio.Lock()
+
 async def send_ship_json(ws, data):
     eebus_text = json_into_eebus_json(data)
     msg = b"\x01" + eebus_text.encode("utf-8")
-    await ws.send(msg)
+    async with ws_send_lock:
+        await ws.send(msg)
 
 async def send_ship_data(ws, data):
     spine_std = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
@@ -324,7 +485,8 @@ async def send_ship_data(ws, data):
     ship_std_obj = {"data": {"header": {"protocolId": "ee1.0"}, "payload": json.loads(payload_placeholder)}}
     ship_std = json.dumps(ship_std_obj, separators=(",", ":"), ensure_ascii=False)
     ship_eebus = json_text_into_eebus_json(ship_std).replace(f"[{payload_placeholder}]", spine_eebus)
-    await ws.send(b"\x02" + ship_eebus.encode("utf-8"))
+    async with ws_send_lock:
+        await ws.send(b"\x02" + ship_eebus.encode("utf-8"))
 
 async def send_access_methods(ws, local_ship_id: str):
     await send_ship_json(ws, {"accessMethods": {"id": local_ship_id}})
@@ -342,8 +504,99 @@ def build_local_detailed_discovery(local_device_address: str) -> Dict[str, Any]:
             {"description": {"featureAddress": {"entity": [0], "feature": 1}, "featureType": "DeviceClassification", "role": "server", "description": "DeviceClassification"}},
             {"description": {"featureAddress": {"entity": [1], "feature": 1}, "featureType": "Measurement", "role": "client", "description": "MeasurementClient"}},
             {"description": {"featureAddress": {"entity": [1], "feature": 2}, "featureType": "Sensing", "role": "client", "description": "SensingClient"}},
+            {"description": {"featureAddress": {"entity": [1], "feature": 3}, "featureType": "HVAC", "role": "client", "description": "HVACClient"}},
+            {"description": {"featureAddress": {"entity": [1], "feature": 4}, "featureType": "Setpoint", "role": "client", "description": "SetpointClient"}},
+            {"description": {"featureAddress": {"entity": [1], "feature": 5}, "featureType": "DeviceClassification", "role": "client", "description": "DeviceClassificationClient"}},
         ],
     }
+
+def _float_to_scaled_number(value: float, step: float = 0.5) -> Dict[str, int]:
+    val = round(round(value / step) * step, 2)
+    val_str = f"{val:.2f}".rstrip("0").rstrip(".")
+    if "." in val_str:
+        decimals = len(val_str.split(".")[1])
+        num = int(round(val * (10 ** decimals)))
+        return {"number": num, "scale": -decimals}
+    return {"number": int(val), "scale": 0}
+
+def _scaled_number_to_float(v: Any) -> Optional[float]:
+    if not isinstance(v, dict): return None
+    number = v.get("number")
+    scale = v.get("scale", 0)
+    try: num = float(number)
+    except (TypeError, ValueError): return None
+    try: scale_int = int(scale)
+    except (TypeError, ValueError): scale_int = 0
+    try: return num * (10.0 ** float(scale_int))
+    except Exception: return None
+
+async def request_binding(
+    ws,
+    *,
+    local_device_address: str,
+    remote_device_address: str,
+    src_entity: list[int],
+    src_feature: int,
+    dst_entity: list[int],
+    dst_feature: int,
+    server_feature_type: str,
+    msg_counter: MsgCounter,
+):
+    src_nm = {"device": local_device_address, "entity": [0], "feature": 0}
+    dst_nm = {"device": remote_device_address, "entity": [0], "feature": 0}
+    bind_cmd = {
+        "nodeManagementBindingRequestCall": {
+            "bindingRequest": {
+                "clientAddress": {
+                    "device": local_device_address,
+                    "entity": src_entity,
+                    "feature": src_feature,
+                },
+                "serverAddress": {
+                    "device": remote_device_address,
+                    "entity": dst_entity,
+                    "feature": dst_feature,
+                },
+                "serverFeatureType": server_feature_type,
+            }
+        }
+    }
+    await send_spine_call(ws, address_source=src_nm, address_destination=dst_nm, cmd=bind_cmd, msg_counter=msg_counter, ack_request=True)
+
+async def send_partial_write(
+    ws,
+    *,
+    local_device_address: str,
+    remote_device_address: str,
+    src_entity: list[int],
+    src_feature: int,
+    dst_entity: list[int],
+    dst_feature: int,
+    function_name: str,
+    payload: Dict[str, Any],
+    msg_counter: MsgCounter,
+):
+    src = {"device": local_device_address, "entity": src_entity, "feature": src_feature}
+    dst = {"device": remote_device_address, "entity": dst_entity, "feature": dst_feature}
+    cmd = OrderedDict([
+        ("function", function_name),
+        ("filter", [{"cmdControl": {"partial": {}}}]),
+        (function_name, payload),
+    ])
+    datagram = {
+        "datagram": {
+            "header": {
+                "specificationVersion": "1.3.0",
+                "addressSource": src,
+                "addressDestination": dst,
+                "msgCounter": await msg_counter.next(),
+                "cmdClassifier": "write",
+                "ackRequest": True,
+            },
+            "payload": {"cmd": [cmd]},
+        }
+    }
+    await send_ship_data(ws, datagram)
 
 def build_device_classification_manufacturer_data(local_device_address: str) -> Dict[str, Any]:
     return {"deviceName": "SHIP Python Client", "deviceCode": "python-ship", "brandName": "Python", "powerSource": "mains3Phase", "serialNumber": local_device_address}
@@ -557,18 +810,37 @@ def parse_measurement_description(cmd: Dict[str, Any]) -> Dict[int, Dict[str, An
 
     return desc_map
 
-def parse_measurement_list(cmd: Dict[str, Any], desc_map: Dict[int, Dict[str, Any]], *, source_address: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
-    def _scaled_number_to_float(v: Any) -> Optional[float]:
-        if not isinstance(v, dict): return None
-        number = v.get("number")
-        scale = v.get("scale", 0)
-        try: num = float(number)
-        except (TypeError, ValueError): return None
-        try: scale_int = int(scale)
-        except (TypeError, ValueError): scale_int = 0
-        try: return num * (10.0 ** float(scale_int))
-        except Exception: return None
+def _handle_hvac_system_function(cmd: Dict[str, Any], src_entity: Optional[list[int]], mqtt_pub: HAMqttPublisher):
+    data = cmd.get("hvacSystemFunctionListData") or {}
+    items = data.get("hvacSystemFunctionData") or []
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        mid = items[0].get("currentOperationModeId")
+        mode_map = {0: "auto", 1: "on", 2: "off", 3: "eco"}
+        mname = mode_map.get(mid, str(mid))
+        if src_entity == [5, 1, 1]:
+            mqtt_pub.publish_control_state("heating/mode", mname)
+            logger.info("📡 Heating mode updated from SPINE: %s (id=%s)", mname, mid)
+        elif src_entity == [4]:
+            mqtt_pub.publish_control_state("dhw/mode", mname)
+            logger.info("📡 DHW mode updated from SPINE: %s (id=%s)", mname, mid)
 
+def _handle_setpoint_data(cmd: Dict[str, Any], src_entity: Optional[list[int]], mqtt_pub: HAMqttPublisher):
+    data = cmd.get("setpointListData") or {}
+    items = data.get("setpointData") or []
+    if isinstance(items, list):
+        for sp in items:
+            if not isinstance(sp, dict): continue
+            sid = sp.get("setpointId")
+            val = _scaled_number_to_float(sp.get("value"))
+            if sid == 1 and val is not None:
+                if src_entity == [5, 1, 1]:
+                    mqtt_pub.publish_control_state("heating/temp", f"{val:.1f}")
+                    logger.info("📡 Heating day setpoint updated from SPINE: %.1f°C", val)
+                elif src_entity == [4]:
+                    mqtt_pub.publish_control_state("dhw/temp", f"{val:.1f}")
+                    logger.info("📡 DHW target setpoint updated from SPINE: %.1f°C", val)
+
+def parse_measurement_list(cmd: Dict[str, Any], desc_map: Dict[int, Dict[str, Any]], *, source_address: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
     ml = cmd.get("measurementListData")
     ml_list: Optional[list] = None
     if isinstance(ml, list): ml_list = ml
@@ -608,8 +880,11 @@ def parse_measurement_list(cmd: Dict[str, Any], desc_map: Dict[int, Dict[str, An
         unit_str = unit if isinstance(unit, str) else str(unit)
         mtype_str = mtype if isinstance(mtype, str) else str(mtype)
 
-        if not _is_acpowertotal_measurement_meta(meta) and "acpowertotal" not in scope_str.lower():
-            continue
+        if scope_str == "unknown" and src_entity:
+            if src_entity == [6]: scope_str = "outsideAirTemperature"; unit_str = "°C"
+            elif src_entity == [4]: scope_str = "dhwTemperature"; unit_str = "°C"
+            elif src_entity == [5, 1, 1]: scope_str = "roomAirTemperature"; unit_str = "°C"
+            elif src_entity == [3, 1]: scope_str = "acPowerTotal"; unit_str = "W"
 
         update = {"measurementId": mid, "scopeType": scope_str, "unit": unit_str, "measurementType": mtype_str, "value": val, "source": {"entity": src_entity, "feature": src_feature}}
         updates.append(update)
@@ -718,6 +993,31 @@ async def main():
         await aiozc.async_register_service(info)
     AsyncServiceBrowser(aiozc.zeroconf, "_ship._tcp.local.", handler)
     
+    await asyncio.to_thread(mqtt_pub.connect)
+
+    command_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _enqueue_command(topic: str, payload: str):
+        loop.call_soon_threadsafe(command_queue.put_nowait, (topic, payload))
+
+    mqtt_pub.command_callback = _enqueue_command
+
+    consecutive_failures = 0
+    last_crash_trigger_time = 0.0
+    CRASH_FAILURE_THRESHOLD = _env_int("VR921_CRASH_FAILURES", 3)
+    CRASH_COOLDOWN_SEC = _env_int("VR921_CRASH_COOLDOWN", 600)
+
+    def check_and_trigger_crash(reason: str) -> None:
+        nonlocal consecutive_failures, last_crash_trigger_time
+        consecutive_failures += 1
+        logger.warning(f"⚠️ VR921 failure count: {consecutive_failures}/{CRASH_FAILURE_THRESHOLD} ({reason})")
+        now = time.time()
+        if consecutive_failures >= CRASH_FAILURE_THRESHOLD and (now - last_crash_trigger_time) >= CRASH_COOLDOWN_SEC:
+            last_crash_trigger_time = now
+            logger.error(f"🚨 VR921 failed {consecutive_failures} consecutive times! Triggering HA reset automation via MQTT...")
+            mqtt_pub.publish_crashed(reason)
+
     try:
         while True:  # Retry loop for connections
             try:
@@ -729,6 +1029,7 @@ async def main():
                     elapsed += 1
             
                 if handler.target_info is None:
+                    check_and_trigger_crash("mDNS discovery timed out")
                     logger.error("❌ No VR921 found. Retrying in 60 seconds...")
                     await asyncio.sleep(60)
                     continue
@@ -759,17 +1060,112 @@ async def main():
                     try:
                         success = await asyncio.wait_for(perform_ship_handshake(ws, local_ship_id), timeout=120)
                     except asyncio.TimeoutError:
+                        check_and_trigger_crash("SHIP handshake timed out")
                         logger.error("❌ Handshake timed out")
                         await asyncio.sleep(10)
                         continue
                     if not success:
+                        check_and_trigger_crash("SHIP handshake failed")
                         logger.error("❌ Handshake failed")
                         await asyncio.sleep(10)
                         continue
                     
                     logger.info("🎯 SHIP layer is up! Waiting for SPINE data...")
+                    consecutive_failures = 0
+                    mqtt_pub._republish_all_discovery()
 
-                    await asyncio.to_thread(mqtt_pub.connect)
+                    async def process_commands():
+                        while True:
+                            try:
+                                topic, payload = await command_queue.get()
+                                if not remote_device_address:
+                                    logger.warning("Remote device not yet ready for command %s", topic)
+                                    command_queue.task_done()
+                                    continue
+
+                                logger.info("⚙️ EEBUS command received: %s -> %s", topic, payload)
+                                if topic == "ship/vr921/heating/mode/set":
+                                    mode_key = payload.lower().strip()
+                                    if mode_key == "heat": mode_key = "on"
+                                    mode_map = {"auto": 0, "on": 1, "off": 2, "eco": 3}
+                                    if mode_key in mode_map:
+                                        mode_id = mode_map[mode_key]
+                                        await request_binding(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                              src_entity=[1], src_feature=3, dst_entity=[5, 1, 1], dst_feature=9, server_feature_type="HVAC", msg_counter=msg_counter)
+                                        await send_partial_write(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                                 src_entity=[1], src_feature=3, dst_entity=[5, 1, 1], dst_feature=9, function_name="hvacSystemFunctionListData",
+                                                                 payload={"hvacSystemFunctionData": [{"systemFunctionId": 0, "currentOperationModeId": mode_id}]}, msg_counter=msg_counter)
+                                        mqtt_pub.publish_control_state("heating/mode", mode_key)
+                                        logger.info("✅ EEBUS set heating mode to %s (id=%d)", mode_key, mode_id)
+
+                                elif topic == "ship/vr921/heating/temp/set":
+                                    try: temp_val = float(payload)
+                                    except ValueError:
+                                        command_queue.task_done()
+                                        continue
+                                    if 5.0 <= temp_val <= 30.0:
+                                        scaled = _float_to_scaled_number(temp_val, step=0.5)
+                                        await request_binding(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                              src_entity=[1], src_feature=4, dst_entity=[5, 1, 1], dst_feature=18, server_feature_type="Setpoint", msg_counter=msg_counter)
+                                        await send_partial_write(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                                 src_entity=[1], src_feature=4, dst_entity=[5, 1, 1], dst_feature=18, function_name="setpointListData",
+                                                                 payload={"setpointData": [{"setpointId": 1, "value": scaled}]}, msg_counter=msg_counter)
+                                        mqtt_pub.publish_control_state("heating/temp", f"{temp_val:.1f}")
+                                        logger.info("✅ EEBUS set heating day setpoint to %.1f°C", temp_val)
+
+                                elif topic == "ship/vr921/heating/cancel_override/set":
+                                    restore_mode = payload.lower().strip() if payload.lower().strip() in ("auto", "on", "off", "eco") else "auto"
+                                    mode_map = {"auto": 0, "on": 1, "off": 2, "eco": 3}
+                                    logger.info("🔄 EEBUS cancelling heating override (cycling off -> %s)...", restore_mode)
+                                    await request_binding(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                          src_entity=[1], src_feature=3, dst_entity=[5, 1, 1], dst_feature=9, server_feature_type="HVAC", msg_counter=msg_counter)
+                                    await send_partial_write(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                             src_entity=[1], src_feature=3, dst_entity=[5, 1, 1], dst_feature=9, function_name="hvacSystemFunctionListData",
+                                                             payload={"hvacSystemFunctionData": [{"systemFunctionId": 0, "currentOperationModeId": 2}]}, msg_counter=msg_counter)
+                                    await asyncio.sleep(2.0)
+                                    await send_partial_write(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                             src_entity=[1], src_feature=3, dst_entity=[5, 1, 1], dst_feature=9, function_name="hvacSystemFunctionListData",
+                                                             payload={"hvacSystemFunctionData": [{"systemFunctionId": 0, "currentOperationModeId": mode_map[restore_mode]}]}, msg_counter=msg_counter)
+                                    mqtt_pub.publish_control_state("heating/mode", restore_mode)
+                                    logger.info("✅ EEBUS heating override cancelled, restored to %s", restore_mode)
+
+                                elif topic == "ship/vr921/dhw/mode/set":
+                                    mode_key = payload.lower().strip()
+                                    if mode_key == "heat": mode_key = "on"
+                                    mode_map = {"auto": 0, "on": 1, "off": 2, "eco": 3}
+                                    if mode_key in mode_map:
+                                        mode_id = mode_map[mode_key]
+                                        await request_binding(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                              src_entity=[1], src_feature=3, dst_entity=[4], dst_feature=9, server_feature_type="HVAC", msg_counter=msg_counter)
+                                        await send_partial_write(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                                 src_entity=[1], src_feature=3, dst_entity=[4], dst_feature=9, function_name="hvacSystemFunctionListData",
+                                                                 payload={"hvacSystemFunctionData": [{"systemFunctionId": 0, "currentOperationModeId": mode_id}]}, msg_counter=msg_counter)
+                                        mqtt_pub.publish_control_state("dhw/mode", mode_key)
+                                        logger.info("✅ EEBUS set DHW mode to %s (id=%d)", mode_key, mode_id)
+
+                                elif topic == "ship/vr921/dhw/temp/set":
+                                    try: temp_val = float(payload)
+                                    except ValueError:
+                                        command_queue.task_done()
+                                        continue
+                                    if 30.0 <= temp_val <= 70.0:
+                                        scaled = _float_to_scaled_number(temp_val, step=1.0)
+                                        await request_binding(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                              src_entity=[1], src_feature=4, dst_entity=[4], dst_feature=18, server_feature_type="Setpoint", msg_counter=msg_counter)
+                                        await send_partial_write(ws, local_device_address=local_device_address, remote_device_address=remote_device_address,
+                                                                 src_entity=[1], src_feature=4, dst_entity=[4], dst_feature=18, function_name="setpointListData",
+                                                                 payload={"setpointData": [{"setpointId": 1, "value": scaled}]}, msg_counter=msg_counter)
+                                        mqtt_pub.publish_control_state("dhw/temp", f"{temp_val:.1f}")
+                                        logger.info("✅ EEBUS set DHW setpoint to %.1f°C", temp_val)
+
+                                command_queue.task_done()
+                            except asyncio.CancelledError:
+                                break
+                            except Exception as err:
+                                logger.error("Error executing command %s: %s", topic, err)
+                                command_queue.task_done()
+
+                    command_task = asyncio.create_task(process_commands())
                     
                     message_count = 0
                     remote_device_address: Optional[str] = None
@@ -782,6 +1178,11 @@ async def main():
                     ha_published: set[str] = set()
                     selected_measurement_servers: list[Dict[str, Any]] = []
 
+                    health_poll_interval = _env_int("VR921_HEALTH_POLL_INTERVAL", 600)
+                    last_frame_time = time.time()
+                    awaiting_health_reply = False
+                    health_check_sent_time = 0.0
+
                     def _desc_key_from_address(addr: Any) -> Optional[tuple[tuple[int, ...], int]]:
                         if not isinstance(addr, dict): return None
                         ent = addr.get("entity")
@@ -793,12 +1194,34 @@ async def main():
                     while True:
                         data = None
                         try:
-                            data = await asyncio.wait_for(ws.recv(), timeout=300)
+                            data = await asyncio.wait_for(ws.recv(), timeout=60)
                         except asyncio.TimeoutError:
-                            logger.debug("⏳ SPINE receive timeout, connection still alive")
+                            now = time.time()
+                            if awaiting_health_reply:
+                                if (now - health_check_sent_time) >= 60:
+                                    logger.warning("❌ VR921 health-check poll timed out after 60s; link appears dead. Triggering reconnect...")
+                                    raise ConnectionError("VR921 SPINE health-check poll timeout")
+                            elif (now - last_frame_time) >= health_poll_interval:
+                                if remote_device_address and selected_measurement_servers:
+                                    logger.info("⏱️ No SPINE frames received for %d seconds. Sending SPINE health-check poll...", int(now - last_frame_time))
+                                    awaiting_health_reply = True
+                                    health_check_sent_time = now
+                                    for server in selected_measurement_servers:
+                                        await request_remote_measurement_once(
+                                            ws,
+                                            local_device_address=local_device_address,
+                                            remote_device_address=remote_device_address,
+                                            remote_measurement_feature=server,
+                                            msg_counter=msg_counter
+                                        )
+                                elif (now - last_frame_time) >= (health_poll_interval + 300):
+                                    logger.warning("❌ Connection idle for %d seconds without completed discovery. Triggering reconnect...", int(now - last_frame_time))
+                                    raise ConnectionError("Connection idle without setup")
                             continue
                         else:
                             message_count += 1
+                            last_frame_time = time.time()
+                            awaiting_health_reply = False
                             logger.info(f"📨 SPINE frame received (#%d) length=%d", message_count, len(data) if isinstance(data, (bytes, str)) else 0)
 
                         if isinstance(data, bytes) and len(data) > 0:
@@ -865,6 +1288,23 @@ async def main():
                                                                 await request_remote_measurement_once(ws, local_device_address=local_device_address, remote_device_address=remote_device_address, remote_measurement_feature=server, msg_counter=msg_counter)
                                                                 logger.info("📤 Measurement discovery poll sent for server: entity=%s feature=%s", server.get("entity"), server.get("feature"))
 
+                                                            logger.info("⏱️ Initial poll for HVAC mode and setpoint data")
+                                                            for dst_ent, dst_feat, func in [
+                                                                ([5, 1, 1], 9, "hvacSystemFunctionListData"),
+                                                                ([5, 1, 1], 18, "setpointListData"),
+                                                                ([4], 9, "hvacSystemFunctionListData"),
+                                                                ([4], 18, "setpointListData"),
+                                                            ]:
+                                                                src_feat = 3 if dst_feat == 9 else 4
+                                                                await send_spine_read(
+                                                                    ws,
+                                                                    address_source=_spine_addr(device=local_device_address, entity=1, feature=src_feat),
+                                                                    address_destination={"device": remote_device_address, "entity": dst_ent, "feature": dst_feat},
+                                                                    cmd={func: {}},
+                                                                    msg_counter=msg_counter,
+                                                                    ack_request=True
+                                                                )
+
                                             elif "nodeManagementUseCaseData" in cmd:
                                                 peer_use_case_received = True
                                                 logger.info("✅ Remote peer use case data received")
@@ -881,6 +1321,23 @@ async def main():
                                                         for server in selected_measurement_servers:
                                                             await request_remote_measurement_once(ws, local_device_address=local_device_address, remote_device_address=remote_device_address, remote_measurement_feature=server, msg_counter=msg_counter)
                                                             logger.info("📤 Measurement discovery poll sent for server: entity=%s feature=%s", server.get("entity"), server.get("feature"))
+
+                                                        logger.info("⏱️ Initial poll for HVAC mode and setpoint data")
+                                                        for dst_ent, dst_feat, func in [
+                                                            ([5, 1, 1], 9, "hvacSystemFunctionListData"),
+                                                            ([5, 1, 1], 18, "setpointListData"),
+                                                            ([4], 9, "hvacSystemFunctionListData"),
+                                                            ([4], 18, "setpointListData"),
+                                                        ]:
+                                                            src_feat = 3 if dst_feat == 9 else 4
+                                                            await send_spine_read(
+                                                                ws,
+                                                                address_source=_spine_addr(device=local_device_address, entity=1, feature=src_feat),
+                                                                address_destination={"device": remote_device_address, "entity": dst_ent, "feature": dst_feat},
+                                                                cmd={func: {}},
+                                                                msg_counter=msg_counter,
+                                                                ack_request=True
+                                                            )
 
                                             elif "measurementDescriptionListData" in cmd:
                                                 logger.info("📥 Received measurementDescriptionListData reply from %s", hdr.get("addressSource"))
@@ -910,17 +1367,27 @@ async def main():
                                                     if isinstance(u.get("value"), (int, float)):
                                                         meta = _guess_ha_metadata(scope, unit)
                                                         if object_id not in ha_published:
-                                                            friendly_name = _friendly_sensor_name(scope, source_entity=ent if isinstance(ent, list) else None)
-                                                            mqtt_pub.ensure_discovery(
-                                                                object_id=object_id,
-                                                                name=friendly_name,
-                                                                unit=meta.get("unit", unit),
-                                                                device_class=meta.get("device_class", ""),
-                                                                state_class=meta.get("state_class", "measurement")
-                                                            )
-                                                            ha_published.add(object_id)
+                                                             friendly_name = _friendly_sensor_name(scope, source_entity=ent if isinstance(ent, list) else None)
+                                                             mqtt_pub.ensure_discovery(
+                                                                 object_id=object_id,
+                                                                 name=friendly_name,
+                                                                 unit=meta.get("unit", unit),
+                                                                 device_class=meta.get("device_class", ""),
+                                                                 state_class=meta.get("state_class", "measurement")
+                                                             )
+                                                             ha_published.add(object_id)
                                                         mqtt_pub.publish_state(object_id=object_id, value=float(u["value"]))
                                                         logger.info("📡 MQTT published %s = %s", object_id, float(u["value"]))
+
+                                            elif "hvacSystemFunctionListData" in cmd:
+                                                logger.info("📥 Received hvacSystemFunctionListData reply from %s", hdr.get("addressSource"))
+                                                addr_src = hdr.get("addressSource") if isinstance(hdr, dict) else {}
+                                                _handle_hvac_system_function(cmd, addr_src.get("entity") if isinstance(addr_src, dict) else None, mqtt_pub)
+
+                                            elif "setpointListData" in cmd:
+                                                logger.info("📥 Received setpointListData reply from %s", hdr.get("addressSource"))
+                                                addr_src = hdr.get("addressSource") if isinstance(hdr, dict) else {}
+                                                _handle_setpoint_data(cmd, addr_src.get("entity") if isinstance(addr_src, dict) else None, mqtt_pub)
 
                                         elif cmd_classifier == "notify":
                                             if "measurementDescriptionListData" in cmd:
@@ -963,6 +1430,16 @@ async def main():
                                                         mqtt_pub.publish_state(object_id=object_id, value=float(u["value"]))
                                                         logger.info("📡 MQTT published %s = %s", object_id, float(u["value"]))
 
+                                            elif "hvacSystemFunctionListData" in cmd:
+                                                logger.info("📥 Received hvacSystemFunctionListData notify from %s", hdr.get("addressSource"))
+                                                addr_src = hdr.get("addressSource") if isinstance(hdr, dict) else {}
+                                                _handle_hvac_system_function(cmd, addr_src.get("entity") if isinstance(addr_src, dict) else None, mqtt_pub)
+
+                                            elif "setpointListData" in cmd:
+                                                logger.info("📥 Received setpointListData notify from %s", hdr.get("addressSource"))
+                                                addr_src = hdr.get("addressSource") if isinstance(hdr, dict) else {}
+                                                _handle_setpoint_data(cmd, addr_src.get("entity") if isinstance(addr_src, dict) else None, mqtt_pub)
+
                                     except Exception as e:
                                         print(f"⚠️  [SPINE] Error processing: {e}")
 
@@ -989,14 +1466,19 @@ async def main():
                                     feat = server.get("feature")
                                     
             except Exception as e:
+                check_and_trigger_crash(f"Connection error: {e}")
                 logger.error(f"❌ Connection error: {e}")
                 import traceback
                 traceback.print_exc()
                 await asyncio.sleep(60)  # Wait before retrying
             finally:
-                try: mqtt_pub.close()
+                try: command_task.cancel()
+                except Exception: pass
+                try: mqtt_pub.publish_availability(False)
                 except Exception: pass
     finally:
+        try: mqtt_pub.close()
+        except Exception: pass
         await aiozc.async_unregister_all_services()
         await aiozc.async_close()
         logger.info("👋 Exiting.")

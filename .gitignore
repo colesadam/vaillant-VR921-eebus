@@ -11,4 +11,6 @@ __pycache__/
 
 # macOS
 .DS_Store
-.venv
+.venv/
+__pycache__/
+certs/
